@@ -8,6 +8,7 @@ import streamlit as st
 import asyncio
 import os
 import hashlib
+import re
 import time
 from datetime import datetime
 from dotenv import load_dotenv
@@ -81,6 +82,9 @@ TRANSLATIONS = {
         "settings": "Settings",
         "api_key_label": "Anthropic API Key",
         "language": "Language / 言語",
+        "run_demo": "Run Demo",
+        "demo_desc": "One-click: analyzes sample contract (Vietnamese TITP trainee, Aichi) for violations",
+        "download_report": "Download Report",
     },
     "vi": {
         "title": "ShieldAgent",
@@ -132,6 +136,9 @@ TRANSLATIONS = {
         "settings": "Cài đặt",
         "api_key_label": "Khóa API Anthropic",
         "language": "Ngôn ngữ / Language",
+        "run_demo": "Chạy Demo",
+        "demo_desc": "Một cú nhấp: phân tích hợp đồng mẫu (thực tập sinh TITP Việt Nam, Aichi)",
+        "download_report": "Tải báo cáo",
     },
     "zh": {
         "title": "ShieldAgent",
@@ -183,6 +190,9 @@ TRANSLATIONS = {
         "settings": "设置",
         "api_key_label": "Anthropic API 密钥",
         "language": "语言 / Language",
+        "run_demo": "运行演示",
+        "demo_desc": "一键分析示例合同（越南TITP实习生，爱知县）",
+        "download_report": "下载报告",
     },
     "ja": {
         "title": "ShieldAgent",
@@ -234,6 +244,9 @@ TRANSLATIONS = {
         "settings": "設定",
         "api_key_label": "Anthropic APIキー",
         "language": "言語 / Language",
+        "run_demo": "デモ実行",
+        "demo_desc": "ワンクリック：サンプル契約書を分析（ベトナム人TITP実習生、愛知県）",
+        "download_report": "レポートをダウンロード",
     },
 }
 
@@ -569,6 +582,77 @@ def compute_evidence_hash(content: str) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+def parse_violation_counts(analysis_text: str) -> dict:
+    """Parse the analysis report to count CRITICAL, VIOLATION, and WARNING occurrences."""
+    text_upper = analysis_text.upper()
+    return {
+        "critical": len(re.findall(r'\bCRITICAL\b', text_upper)),
+        "violation": len(re.findall(r'\bVIOLATION\b', text_upper)),
+        "warning": len(re.findall(r'\bWARNING\b', text_upper)),
+    }
+
+
+def colorize_analysis(analysis_text: str) -> str:
+    """Wrap each article section in color-coded HTML based on severity."""
+    sections = re.split(r'(### )', analysis_text)
+    result = []
+    for i, section in enumerate(sections):
+        if section == '### ':
+            continue
+        if i > 0 and sections[i - 1] == '### ':
+            section_full = '### ' + section
+            upper = section_full.upper()
+            if 'CRITICAL' in upper:
+                css_class = 'severity-critical'
+            elif 'VIOLATION' in upper:
+                css_class = 'severity-violation'
+            elif 'WARNING' in upper:
+                css_class = 'severity-warning'
+            else:
+                result.append(section_full)
+                continue
+            result.append(f'<div class="{css_class}">\n\n{section_full}\n\n</div>')
+        else:
+            result.append(section)
+    return ''.join(result)
+
+
+def build_download_report(translation: str, analysis: str, evidence_hash: str,
+                          timestamp: str, prefecture: str, visa_type: str) -> str:
+    """Build a plain-text report for download."""
+    return f"""================================================================
+         SHIELDAGENT CONTRACT ANALYSIS REPORT
+================================================================
+  Generated:  {timestamp}Z
+  Prefecture: {prefecture}
+  Visa Type:  {visa_type}
+  Evidence:   SHA-256: {evidence_hash}
+  Network:    Neo N3 (simulated)
+================================================================
+
+--- TRANSLATED CONTRACT ---
+
+{translation}
+
+--- ANALYSIS REPORT ---
+
+{analysis}
+
+--- RECOMMENDED ACTIONS ---
+
+1. OTIT Hotline: 0120-250-168 (Vietnamese, Chinese, Filipino, Indonesian)
+2. FRESC: 0120-76-2029 (14 languages)
+3. Legal Aid (Houterasu): 0570-078377
+4. Keep a copy of this report as evidence
+
+================================================================
+DISCLAIMER: AI-generated analysis for informational purposes only.
+Consult a qualified legal professional.
+================================================================
+Built with ShieldAgent | SpoonOS x Neo | Scoop AI Hackathon 2026
+"""
+
+
 # ============================================================
 # Custom CSS
 # ============================================================
@@ -630,6 +714,47 @@ st.markdown("""
     .flow-diagram .highlight {
         color: #00E599;
         font-weight: bold;
+    }
+    .severity-critical {
+        background: rgba(255, 59, 48, 0.15);
+        border-left: 4px solid #FF3B30;
+        padding: 12px 16px;
+        margin: 8px 0;
+        border-radius: 0 8px 8px 0;
+    }
+    .severity-violation {
+        background: rgba(255, 149, 0, 0.15);
+        border-left: 4px solid #FF9500;
+        padding: 12px 16px;
+        margin: 8px 0;
+        border-radius: 0 8px 8px 0;
+    }
+    .severity-warning {
+        background: rgba(255, 204, 0, 0.15);
+        border-left: 4px solid #FFCC00;
+        padding: 12px 16px;
+        margin: 8px 0;
+        border-radius: 0 8px 8px 0;
+    }
+    .severity-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: bold;
+        margin-left: 8px;
+    }
+    .badge-critical { background: #FF3B30; color: white; }
+    .badge-violation { background: #FF9500; color: white; }
+    .badge-warning { background: #FFCC00; color: #000; }
+    .demo-btn {
+        background: linear-gradient(135deg, #00E599, #00B876);
+        color: #000;
+        font-weight: bold;
+        border: none;
+        border-radius: 12px;
+        padding: 16px 32px;
+        font-size: 18px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -744,6 +869,15 @@ def main():
         st.markdown(f"## {t('contract_guardian')}")
         st.markdown(t("contract_desc"))
 
+        # One-click demo button for judges
+        demo_col1, demo_col2 = st.columns([2, 3])
+        with demo_col1:
+            run_demo = st.button(t("run_demo"), type="primary", use_container_width=True)
+        with demo_col2:
+            st.caption(t("demo_desc"))
+
+        st.markdown("---")
+
         col1, col2 = st.columns(2)
         with col1:
             prefecture = st.selectbox(t("prefecture"), PREFECTURES, index=3)
@@ -761,7 +895,16 @@ def main():
             else:
                 contract_text = st.text_area("Paste contract", height=250, placeholder="雇用契約書...")
 
-        if st.button(t("analyze_btn"), type="primary", use_container_width=True):
+        # Handle both the demo button and the regular analyze button
+        analyze_clicked = st.button(t("analyze_btn"), type="secondary", use_container_width=True)
+
+        # Demo button uses sample contract with preset defaults
+        if run_demo:
+            contract_text = SAMPLE_CONTRACT
+            prefecture = "Aichi"
+            visa_type = "TITP (Technical Intern Training)"
+
+        if run_demo or analyze_clicked:
             if not contract_text.strip():
                 st.error("Please provide a contract.")
             elif not get_api_key():
@@ -822,13 +965,31 @@ def main():
         if "analysis_report" in st.session_state:
             st.markdown("---")
 
+            # Violation severity dashboard
+            counts = parse_violation_counts(st.session_state["analysis_report"])
+            total = counts["critical"] + counts["violation"] + counts["warning"]
+            dc1, dc2, dc3, dc4 = st.columns(4)
+            dc1.metric("Total Issues", total)
+            dc2.metric("Critical", counts["critical"], delta=None)
+            dc3.metric("Violations", counts["violation"], delta=None)
+            dc4.metric("Warnings", counts["warning"], delta=None)
+
+            # Risk level indicator
+            if counts["critical"] > 0:
+                st.error(f"RISK LEVEL: HIGH — {counts['critical']} critical issue(s) found. Immediate action recommended.")
+            elif counts["violation"] > 0:
+                st.warning(f"RISK LEVEL: MEDIUM — {counts['violation']} violation(s) found.")
+            else:
+                st.info(f"RISK LEVEL: LOW — {counts['warning']} warning(s) found.")
+
             # Translation
             with st.expander(t("view_translation"), expanded=False):
                 st.markdown(st.session_state["analysis_translation"])
 
-            # Analysis
+            # Color-coded analysis
             st.markdown(f"## {t('report_title')}")
-            st.markdown(st.session_state["analysis_report"])
+            colored = colorize_analysis(st.session_state["analysis_report"])
+            st.markdown(colored, unsafe_allow_html=True)
 
             # Evidence hash
             st.markdown("### Blockchain Evidence")
@@ -846,6 +1007,23 @@ def main():
             st.markdown(f"### {t('actions_title')}")
             for action in t("actions"):
                 st.markdown(f"- {action}")
+
+            # Download report button
+            report_text = build_download_report(
+                st.session_state["analysis_translation"],
+                st.session_state["analysis_report"],
+                st.session_state["analysis_hash"],
+                st.session_state["analysis_timestamp"],
+                st.session_state.get("analysis_prefecture", ""),
+                st.session_state.get("analysis_visa", ""),
+            )
+            st.download_button(
+                label=t("download_report"),
+                data=report_text,
+                file_name=f"shieldagent_report_{st.session_state['analysis_timestamp'][:10]}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
             st.caption(t("disclaimer"))
 
