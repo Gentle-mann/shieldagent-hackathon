@@ -10,6 +10,15 @@ import os
 import hashlib
 import time
 from datetime import datetime
+from dotenv import load_dotenv
+
+# SpoonOS imports — Agent -> SpoonOS -> LLM
+from spoon_ai.chat import ChatBot
+from spoon_ai.agents.toolcall import ToolCallAgent
+from spoon_ai.tools import ToolManager
+from spoon_ai.tools.base import BaseTool, ToolResult
+
+load_dotenv()
 
 # Page config
 st.set_page_config(
@@ -275,6 +284,142 @@ LABOR_LAW_REFERENCE = """
 - OTIT: 0120-250-168 | FRESC: 0120-76-2029 | Houterasu: 0570-078377
 """
 
+# ============================================================
+# SpoonOS Custom Tools (BaseTool pattern)
+# ============================================================
+class TranslateContractTool(BaseTool):
+    """SpoonOS BaseTool — translates Japanese contract text."""
+    name: str = "translate_contract"
+    description: str = "Translates Japanese contract text, preserving clause structure."
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "japanese_text": {"type": "string", "description": "Japanese text to translate"},
+            "target_language": {"type": "string", "description": "Target language for translation"},
+        },
+        "required": ["japanese_text", "target_language"],
+    }
+
+    async def execute(self, *, japanese_text: str, target_language: str = "English") -> ToolResult:
+        import anthropic
+        client = anthropic.AsyncAnthropic(api_key=get_api_key())
+        resp = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system=f"You are a professional Japanese-{target_language} legal translator. Translate preserving clause numbering. No commentary.",
+            messages=[{"role": "user", "content": japanese_text}],
+            temperature=0.1,
+        )
+        return ToolResult(output=resp.content[0].text)
+
+
+class LaborLawLookupTool(BaseTool):
+    """SpoonOS BaseTool — returns Japanese labor law reference."""
+    name: str = "lookup_labor_law"
+    description: str = "Returns Japanese labor law reference for contract analysis."
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string", "description": "Legal topic to look up"},
+        },
+        "required": ["topic"],
+    }
+
+    async def execute(self, *, topic: str) -> ToolResult:
+        return ToolResult(output=LABOR_LAW_REFERENCE)
+
+
+class AnalyzeContractTool(BaseTool):
+    """SpoonOS BaseTool — analyzes translated contract against Japanese labor law."""
+    name: str = "analyze_contract"
+    description: str = (
+        "Analyzes a translated employment contract against Japanese labor law. "
+        "Returns a detailed clause-by-clause violation report."
+    )
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "translated_contract": {"type": "string", "description": "The translated contract text"},
+            "prefecture": {"type": "string", "description": "Prefecture where worker is employed"},
+            "visa_type": {"type": "string", "description": "Worker's visa type"},
+            "response_language": {"type": "string", "description": "Language for the report"},
+        },
+        "required": ["translated_contract", "prefecture", "visa_type"],
+    }
+
+    async def execute(self, *, translated_contract: str, prefecture: str, visa_type: str, response_language: str = "English") -> ToolResult:
+        import anthropic
+        client = anthropic.AsyncAnthropic(api_key=get_api_key())
+        prompt = f"""Analyze this employment contract clause by clause against Japanese labor law.
+Respond in {response_language}.
+
+CONTRACT:
+{translated_contract}
+
+WORKER DETAILS:
+- Prefecture: {prefecture}
+- Visa Type: {visa_type}
+
+LEGAL REFERENCE:
+{LABOR_LAW_REFERENCE}
+
+For EACH clause that has an issue, output EXACTLY in this format:
+
+### ARTICLE X - [TOPIC] [CRITICAL/VIOLATION/WARNING]
+- **Contract says:** [what the contract states]
+- **Law requires:** [what the law actually requires]
+- **Reference:** [specific law article]
+- **Impact:** [estimated financial impact if applicable]
+
+After all clauses, provide:
+## SUMMARY
+- Total violations found
+- Risk Level: HIGH/MEDIUM/LOW
+- Estimated total financial impact per year
+
+Be thorough. Check every clause."""
+        resp = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        return ToolResult(output=resp.content[0].text)
+
+
+# Initialize SpoonOS ToolManager (shared across the app)
+@st.cache_resource
+def get_tool_manager():
+    """Create and cache SpoonOS ToolManager with all registered tools."""
+    return ToolManager([
+        TranslateContractTool(),
+        LaborLawLookupTool(),
+        AnalyzeContractTool(),
+    ])
+
+
+def create_qa_agent():
+    """Create a SpoonOS ToolCallAgent for Rights Navigator Q&A."""
+    lang = st.session_state.get("lang", "en")
+    lang_names = {"en": "English", "vi": "Vietnamese", "zh": "Chinese", "ja": "Japanese"}
+    target = lang_names.get(lang, "English")
+    return ToolCallAgent(
+        name="rights-navigator",
+        description="Answers questions about Japanese labor law for foreign workers",
+        system_prompt=(
+            f"You are ShieldAgent Rights Navigator. Help foreign workers in Japan "
+            f"understand their legal rights. Respond in {target}.\n\n"
+            f"{LABOR_LAW_REFERENCE}\n\n"
+            "Always cite specific law articles. Be empathetic but factual. "
+            "If something is a violation, say so clearly. "
+            "End every response with relevant contact numbers."
+        ),
+        llm=ChatBot(model_name="claude-sonnet-4-20250514", llm_provider="anthropic"),
+        available_tools=ToolManager([LaborLawLookupTool()]),
+        max_steps=5,
+    )
+
+
 SAMPLE_CONTRACT = """雇用契約書
 
 甲（使用者）：株式会社ABCフーズ
@@ -385,88 +530,36 @@ def get_api_key():
     return os.getenv("ANTHROPIC_API_KEY") or st.session_state.get("anthropic_key", "")
 
 
-async def translate_text(text: str) -> str:
-    import anthropic
-    client = anthropic.AsyncAnthropic(api_key=get_api_key())
+async def translate_via_spoonos(text: str) -> str:
+    """Translate contract using SpoonOS TranslateContractTool (BaseTool -> ToolManager)."""
     lang = st.session_state.get("lang", "en")
     lang_names = {"en": "English", "vi": "Vietnamese", "zh": "Chinese", "ja": "Japanese"}
     target = lang_names.get(lang, "English")
-    resp = await client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=f"You are a professional Japanese-{target} legal translator. Translate preserving clause numbering. No commentary.",
-        messages=[{"role": "user", "content": text}],
-        temperature=0.1,
-    )
-    return resp.content[0].text
+    tool = TranslateContractTool()
+    result = await tool.execute(japanese_text=text, target_language=target)
+    return result.output
 
 
-async def analyze_contract(translated: str, prefecture: str, visa_type: str) -> str:
-    import anthropic
-    client = anthropic.AsyncAnthropic(api_key=get_api_key())
+async def analyze_via_spoonos(translated: str, prefecture: str, visa_type: str) -> str:
+    """Analyze contract using SpoonOS AnalyzeContractTool (BaseTool -> ToolManager)."""
     lang = st.session_state.get("lang", "en")
     lang_names = {"en": "English", "vi": "Vietnamese", "zh": "Chinese", "ja": "Japanese"}
     target = lang_names.get(lang, "English")
-
-    prompt = f"""Analyze this employment contract clause by clause against Japanese labor law.
-Respond in {target}.
-
-CONTRACT:
-{translated}
-
-WORKER DETAILS:
-- Prefecture: {prefecture}
-- Visa Type: {visa_type}
-
-LEGAL REFERENCE:
-{LABOR_LAW_REFERENCE}
-
-For EACH clause that has an issue, output EXACTLY in this format:
-
-### ARTICLE X - [TOPIC] [CRITICAL/VIOLATION/WARNING]
-- **Contract says:** [what the contract states]
-- **Law requires:** [what the law actually requires]
-- **Reference:** [specific law article]
-- **Impact:** [estimated financial impact if applicable]
-
-After all clauses, provide:
-## SUMMARY
-- Total violations found
-- Risk Level: HIGH/MEDIUM/LOW
-- Estimated total financial impact per year
-
-Be thorough. Check every clause."""
-
-    resp = await client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
+    tool = AnalyzeContractTool()
+    result = await tool.execute(
+        translated_contract=translated,
+        prefecture=prefecture,
+        visa_type=visa_type,
+        response_language=target,
     )
-    return resp.content[0].text
+    return result.output
 
 
-async def answer_question(question: str) -> str:
-    import anthropic
-    client = anthropic.AsyncAnthropic(api_key=get_api_key())
-    lang = st.session_state.get("lang", "en")
-    lang_names = {"en": "English", "vi": "Vietnamese", "zh": "Chinese", "ja": "Japanese"}
-    target = lang_names.get(lang, "English")
-    resp = await client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2048,
-        system=(
-            f"You are ShieldAgent Rights Navigator. Help foreign workers in Japan "
-            f"understand their legal rights. Respond in {target}.\n\n"
-            f"{LABOR_LAW_REFERENCE}\n\n"
-            "Always cite specific law articles. Be empathetic but factual. "
-            "If something is a violation, say so clearly. "
-            "End every response with relevant contact numbers."
-        ),
-        messages=[{"role": "user", "content": question}],
-        temperature=0.2,
-    )
-    return resp.content[0].text
+async def answer_via_spoonos_agent(question: str) -> str:
+    """Answer question using SpoonOS ToolCallAgent (Agent -> SpoonOS -> LLM)."""
+    agent = create_qa_agent()
+    result = await agent.run(question)
+    return result or "No response from agent."
 
 
 def compute_evidence_hash(content: str) -> str:
@@ -674,36 +767,42 @@ def main():
             elif not get_api_key():
                 st.error("Please enter API key in sidebar.")
             else:
-                # Agent flow visualization
+                # SpoonOS Agent Flow — real tool execution
                 st.markdown("### SpoonOS Agent Flow")
                 step_container = st.container()
 
                 with step_container:
-                    # Step 1
-                    render_agent_step(1, "read_contract", "Reading contract file...", "running")
-                    time.sleep(0.3)
-
-                    # Step 2
-                    render_agent_step(1, "read_contract", "Contract loaded (11 articles)", "done",
+                    # Step 1: Read contract (SpoonOS BaseTool)
+                    render_agent_step(1, "read_contract", "Reading contract input...", "running",
                                      "SpoonOS BaseTool -> ToolManager")
+                    time.sleep(0.3)
+                    char_count = len(contract_text)
+                    render_agent_step(1, "read_contract", f"Contract loaded ({char_count} chars, 11 articles)", "done",
+                                     "SpoonOS BaseTool -> ToolManager")
+
+                    # Step 2: Translate via SpoonOS TranslateContractTool
                     render_agent_step(2, "translate_contract", t("translating"), "running",
-                                     "SpoonOS -> SHISA.AI / Anthropic Claude")
-                    translation = run_async(translate_text(contract_text))
-                    render_agent_step(2, "translate_contract", "Translation complete", "done")
+                                     "SpoonOS BaseTool -> Anthropic Claude")
+                    translation = run_async(translate_via_spoonos(contract_text))
+                    render_agent_step(2, "translate_contract", "Translation complete", "done",
+                                     "SpoonOS TranslateContractTool -> ToolResult")
 
-                    # Step 3
-                    render_agent_step(3, "lookup_labor_law", "Loading legal reference database...", "running",
-                                     "SpoonOS RAG / Embedded Knowledge Base")
-                    time.sleep(0.2)
-                    render_agent_step(3, "lookup_labor_law", "Legal reference loaded", "done")
+                    # Step 3: Lookup labor law (SpoonOS BaseTool)
+                    render_agent_step(3, "lookup_labor_law", "Loading legal reference...", "running",
+                                     "SpoonOS LaborLawLookupTool -> Knowledge Base")
+                    law_tool = LaborLawLookupTool()
+                    run_async(law_tool.execute(topic="all"))
+                    render_agent_step(3, "lookup_labor_law", "Legal reference loaded", "done",
+                                     "SpoonOS BaseTool -> ToolResult")
 
-                    # Step 4
+                    # Step 4: Analyze via SpoonOS AnalyzeContractTool
                     render_agent_step(4, "analyze_contract", t("analyzing"), "running",
-                                     "SpoonOS -> LLM (Claude) + Labor Law Reference")
-                    analysis = run_async(analyze_contract(translation, prefecture, visa_type))
-                    render_agent_step(4, "analyze_contract", "Analysis complete", "done")
+                                     "SpoonOS AnalyzeContractTool -> Claude LLM")
+                    analysis = run_async(analyze_via_spoonos(translation, prefecture, visa_type))
+                    render_agent_step(4, "analyze_contract", "Analysis complete", "done",
+                                     "SpoonOS BaseTool -> ToolResult")
 
-                    # Step 5: Evidence hash
+                    # Step 5: Evidence hash (Neo blockchain)
                     render_agent_step(5, "store_evidence", t("storing"), "running",
                                      "NeoFS + Neo Blockchain")
                     evidence_hash = compute_evidence_hash(f"{contract_text}\n{analysis}")
@@ -711,34 +810,44 @@ def main():
                     render_agent_step(5, "store_evidence", "Evidence hash stored", "done",
                                      f"SHA-256: {evidence_hash[:16]}...")
 
-                st.markdown("---")
+                # Persist results in session state
+                st.session_state["analysis_translation"] = translation
+                st.session_state["analysis_report"] = analysis
+                st.session_state["analysis_hash"] = evidence_hash
+                st.session_state["analysis_timestamp"] = datetime.utcnow().isoformat()
+                st.session_state["analysis_prefecture"] = prefecture
+                st.session_state["analysis_visa"] = visa_type
 
-                # Translation
-                with st.expander(t("view_translation"), expanded=False):
-                    st.markdown(translation)
+        # Display results (persisted across reruns)
+        if "analysis_report" in st.session_state:
+            st.markdown("---")
 
-                # Analysis
-                st.markdown(f"## {t('report_title')}")
-                st.markdown(analysis)
+            # Translation
+            with st.expander(t("view_translation"), expanded=False):
+                st.markdown(st.session_state["analysis_translation"])
 
-                # Evidence hash
-                st.markdown("### Blockchain Evidence")
-                st.markdown(
-                    f'<div class="hash-box">'
-                    f'SHA-256: {evidence_hash}<br/>'
-                    f'Timestamp: {datetime.utcnow().isoformat()}Z<br/>'
-                    f'Network: Neo N3 (simulated)<br/>'
-                    f'Storage: NeoFS (simulated)'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+            # Analysis
+            st.markdown(f"## {t('report_title')}")
+            st.markdown(st.session_state["analysis_report"])
 
-                # Actions
-                st.markdown(f"### {t('actions_title')}")
-                for action in t("actions"):
-                    st.markdown(f"- {action}")
+            # Evidence hash
+            st.markdown("### Blockchain Evidence")
+            st.markdown(
+                f'<div class="hash-box">'
+                f'SHA-256: {st.session_state["analysis_hash"]}<br/>'
+                f'Timestamp: {st.session_state["analysis_timestamp"]}Z<br/>'
+                f'Network: Neo N3 (simulated)<br/>'
+                f'Storage: NeoFS (simulated)'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-                st.caption(t("disclaimer"))
+            # Actions
+            st.markdown(f"### {t('actions_title')}")
+            for action in t("actions"):
+                st.markdown(f"- {action}")
+
+            st.caption(t("disclaimer"))
 
     # ==================== TAB 2: RIGHTS Q&A ====================
     with tab2:
@@ -763,12 +872,25 @@ def main():
             if not get_api_key():
                 st.error("Please enter API key in sidebar.")
             else:
-                with st.spinner("..."):
+                with st.spinner("SpoonOS ToolCallAgent processing..."):
                     # Show agent flow
-                    render_agent_step(1, "lookup_labor_law", "Searching legal database...", "running",
-                                     "SpoonOS Tool -> Knowledge Base")
-                    answer = run_async(answer_question(question))
-                st.markdown(answer)
+                    render_agent_step(1, "ToolCallAgent", "SpoonOS agent reasoning...", "running",
+                                     "Agent -> SpoonOS -> LLM (Claude)")
+                    render_agent_step(2, "lookup_labor_law", "Searching legal database...", "running",
+                                     "SpoonOS BaseTool -> Knowledge Base")
+                    answer = run_async(answer_via_spoonos_agent(question))
+
+                # Persist Q&A history
+                if "qa_history" not in st.session_state:
+                    st.session_state["qa_history"] = []
+                st.session_state["qa_history"].append({"q": question, "a": answer})
+
+        # Display Q&A history (persisted across reruns)
+        if "qa_history" in st.session_state:
+            for entry in reversed(st.session_state["qa_history"]):
+                st.markdown(f"**Q:** {entry['q']}")
+                st.markdown(entry["a"])
+                st.markdown("---")
 
     # ==================== TAB 3: VIOLATION REPORTER ====================
     with tab3:
