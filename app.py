@@ -8,10 +8,14 @@ import streamlit as st
 import asyncio
 import os
 import hashlib
+import io
 import re
 import time
 from datetime import datetime
 from dotenv import load_dotenv
+
+import speech_recognition as sr
+import edge_tts
 
 # SpoonOS imports — Agent -> SpoonOS -> LLM
 from spoon_ai.chat import ChatBot
@@ -85,6 +89,10 @@ TRANSLATIONS = {
         "run_demo": "Run Demo",
         "demo_desc": "One-click: analyzes sample contract (Vietnamese TITP trainee, Aichi) for violations",
         "download_report": "Download Report",
+        "voice_input": "Voice Input",
+        "voice_output": "Listen",
+        "transcription": "You said:",
+        "listen_summary": "Listen to Summary",
     },
     "vi": {
         "title": "ShieldAgent",
@@ -139,6 +147,10 @@ TRANSLATIONS = {
         "run_demo": "Chạy Demo",
         "demo_desc": "Một cú nhấp: phân tích hợp đồng mẫu (thực tập sinh TITP Việt Nam, Aichi)",
         "download_report": "Tải báo cáo",
+        "voice_input": "Nhập giọng nói",
+        "voice_output": "Nghe",
+        "transcription": "Bạn nói:",
+        "listen_summary": "Nghe tóm tắt",
     },
     "zh": {
         "title": "ShieldAgent",
@@ -193,6 +205,10 @@ TRANSLATIONS = {
         "run_demo": "运行演示",
         "demo_desc": "一键分析示例合同（越南TITP实习生，爱知县）",
         "download_report": "下载报告",
+        "voice_input": "语音输入",
+        "voice_output": "收听",
+        "transcription": "您说的是:",
+        "listen_summary": "收听摘要",
     },
     "ja": {
         "title": "ShieldAgent",
@@ -247,6 +263,10 @@ TRANSLATIONS = {
         "run_demo": "デモ実行",
         "demo_desc": "ワンクリック：サンプル契約書を分析（ベトナム人TITP実習生、愛知県）",
         "download_report": "レポートをダウンロード",
+        "voice_input": "音声入力",
+        "voice_output": "音声で聞く",
+        "transcription": "あなたの発言:",
+        "listen_summary": "要約を聞く",
     },
 }
 
@@ -537,6 +557,58 @@ def run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+# ============================================================
+# Voice helpers (STT + TTS)
+# ============================================================
+EDGE_TTS_VOICES = {
+    "en": "en-US-AriaNeural",
+    "vi": "vi-VN-HoaiMyNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ja": "ja-JP-NanamiNeural",
+}
+
+SR_LANGUAGE_CODES = {
+    "en": "en-US",
+    "vi": "vi-VN",
+    "zh": "zh-CN",
+    "ja": "ja-JP",
+}
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """Convert WAV audio bytes to text using SpeechRecognition + Google Web API."""
+    recognizer = sr.Recognizer()
+    audio_file = io.BytesIO(audio_bytes)
+    with sr.AudioFile(audio_file) as source:
+        audio_data = recognizer.record(source)
+    lang = st.session_state.get("lang", "en")
+    sr_lang = SR_LANGUAGE_CODES.get(lang, "en-US")
+    try:
+        return recognizer.recognize_google(audio_data, language=sr_lang)
+    except sr.UnknownValueError:
+        return ""
+    except sr.RequestError:
+        return ""
+
+
+async def _generate_tts(text: str, lang: str) -> bytes:
+    """Internal async helper to generate TTS audio via edge-tts."""
+    voice = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES["en"])
+    communicate = edge_tts.Communicate(text, voice)
+    buffer = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buffer.write(chunk["data"])
+    return buffer.getvalue()
+
+
+def text_to_speech(text: str, lang: str = None) -> bytes:
+    """Generate MP3 audio bytes from text via edge-tts."""
+    if lang is None:
+        lang = st.session_state.get("lang", "en")
+    return run_async(_generate_tts(text, lang))
 
 
 def get_api_key():
@@ -991,6 +1063,19 @@ def main():
             colored = colorize_analysis(st.session_state["analysis_report"])
             st.markdown(colored, unsafe_allow_html=True)
 
+            # Voice readback of summary section
+            if st.button(t("listen_summary"), key="listen_summary_btn"):
+                report_text = st.session_state["analysis_report"]
+                # Extract SUMMARY section
+                summary_match = re.search(r'## SUMMARY\b.*', report_text, re.DOTALL | re.IGNORECASE)
+                summary_text = summary_match.group(0) if summary_match else report_text[-500:]
+                # Strip markdown formatting for cleaner TTS
+                summary_clean = re.sub(r'[#*\-|]', '', summary_text).strip()
+                with st.spinner("Generating audio..."):
+                    tts_bytes = text_to_speech(summary_clean)
+                if tts_bytes:
+                    st.audio(tts_bytes, format="audio/mp3")
+
             # Evidence hash
             st.markdown("### Blockchain Evidence")
             st.markdown(
@@ -1032,6 +1117,20 @@ def main():
         st.markdown(f"## {t('rights_nav')}")
         st.markdown(t("rights_desc"))
 
+        # Voice input
+        st.markdown(f"**{t('voice_input')}**")
+        audio_value = st.audio_input(t("voice_input"), label_visibility="collapsed")
+        if audio_value is not None:
+            audio_bytes = audio_value.getvalue()
+            if audio_bytes:
+                with st.spinner("Transcribing..."):
+                    transcribed = transcribe_audio(audio_bytes)
+                if transcribed:
+                    st.info(f"{t('transcription')} {transcribed}")
+                    st.session_state["qa_input"] = transcribed
+                else:
+                    st.warning("Could not transcribe audio. Please try again or type your question.")
+
         lang = st.session_state.get("lang", "en")
         examples = TRANSLATIONS.get(lang, TRANSLATIONS["en"])["examples"]
         example_cols = st.columns(3)
@@ -1063,8 +1162,19 @@ def main():
                     st.session_state["qa_history"] = []
                 st.session_state["qa_history"].append({"q": question, "a": answer})
 
+                # Generate TTS for the answer
+                with st.spinner("Generating audio..."):
+                    tts_audio = text_to_speech(answer)
+                if tts_audio:
+                    st.session_state["qa_last_audio"] = tts_audio
+
         # Display Q&A history (persisted across reruns)
         if "qa_history" in st.session_state:
+            # Play audio for the most recent answer
+            if "qa_last_audio" in st.session_state:
+                st.markdown(f"**{t('voice_output')}**")
+                st.audio(st.session_state["qa_last_audio"], format="audio/mp3")
+
             for entry in reversed(st.session_state["qa_history"]):
                 st.markdown(f"**Q:** {entry['q']}")
                 st.markdown(entry["a"])
