@@ -576,15 +576,18 @@ def main():
         )
         st.session_state["lang"] = LANG_OPTIONS[lang_choice]
 
-        # API key
-        api_key = st.text_input(
-            t("api_key_label"),
-            type="password",
-            value=os.getenv("ANTHROPIC_API_KEY", ""),
-        )
-        if api_key:
-            st.session_state["anthropic_key"] = api_key
-            os.environ["ANTHROPIC_API_KEY"] = api_key
+        # API key - only show input if not set via env/secrets
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            api_key = st.text_input(
+                t("api_key_label"),
+                type="password",
+                value="",
+            )
+            if api_key:
+                st.session_state["anthropic_key"] = api_key
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+        else:
+            st.success("API key configured")
 
         st.markdown("---")
 
