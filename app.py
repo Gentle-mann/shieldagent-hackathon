@@ -427,7 +427,7 @@ def create_qa_agent():
             "If something is a violation, say so clearly. "
             "End every response with relevant contact numbers."
         ),
-        llm=ChatBot(model_name="claude-sonnet-4-20250514", llm_provider="anthropic"),
+        llm=ChatBot(model_name="claude-sonnet-4-20250514", llm_provider="anthropic", api_key=get_api_key()),
         available_tools=ToolManager([LaborLawLookupTool()]),
         max_steps=5,
     )
